@@ -748,3 +748,255 @@ func TestStoreEdgeCases(t *testing.T) {
 		assert.Equal(t, dfs.ErrStoreIsClosed, err)
 	})
 }
+
+func TestTransactions(t *testing.T) {
+	// Setup
+	fileName := "test_transactions.db"
+	defer os.Remove(fileName)
+
+	store, err := dfs.NewStore[string, TestValue](fileName)
+	assert.NoError(t, err)
+	defer store.Close()
+
+	t.Run("Basic Transaction Commit", func(t *testing.T) {
+		tx := store.Begin()
+
+		// Set two values
+		err := tx.Set(TestValue{ID: "1", Data: "first"})
+		assert.NoError(t, err)
+		err = tx.Set(TestValue{ID: "2", Data: "second"})
+		assert.NoError(t, err)
+
+		// Commit
+		err = tx.Commit()
+		assert.NoError(t, err)
+
+		// Verify
+		val1, ok := store.Get("1")
+		assert.True(t, ok)
+		assert.Equal(t, "first", val1.Data)
+
+		val2, ok := store.Get("2")
+		assert.True(t, ok)
+		assert.Equal(t, "second", val2.Data)
+	})
+
+	t.Run("Transaction Rollback", func(t *testing.T) {
+		tx := store.Begin()
+
+		// Set a value
+		err := tx.Set(TestValue{ID: "3", Data: "should not exist"})
+		assert.NoError(t, err)
+
+		// Rollback
+		tx.Rollback()
+
+		// Verify value wasn't stored
+		_, ok := store.Get("3")
+		assert.False(t, ok)
+	})
+
+	t.Run("Transaction Conflict", func(t *testing.T) {
+		// First transaction
+		tx1 := store.Begin()
+		err := tx1.Set(TestValue{ID: "4", Data: "first attempt"})
+		assert.NoError(t, err)
+
+		// Second transaction modifies same key
+		tx2 := store.Begin()
+		err = tx2.Set(TestValue{ID: "4", Data: "second attempt"})
+		assert.NoError(t, err)
+
+		// Commit first transaction
+		err = tx1.Commit()
+		assert.NoError(t, err)
+
+		// Second transaction should fail
+		err = tx2.Commit()
+		assert.ErrorIs(t, err, dfs.ErrTransactionConflict)
+
+		// Verify first transaction's value was stored
+		val, ok := store.Get("4")
+		assert.True(t, ok)
+		assert.Equal(t, "first attempt", val.Data)
+	})
+
+	t.Run("Mixed Operations in Transaction", func(t *testing.T) {
+		// Setup initial value
+		err := store.Set(TestValue{ID: "5", Data: "initial"})
+		assert.NoError(t, err)
+
+		tx := store.Begin()
+
+		// Update existing
+		err = tx.Set(TestValue{ID: "5", Data: "updated"})
+		assert.NoError(t, err)
+
+		// Delete another
+		err = tx.Delete("1") // from first test
+		assert.NoError(t, err)
+
+		// Add new
+		err = tx.Set(TestValue{ID: "6", Data: "new"})
+		assert.NoError(t, err)
+
+		// Commit
+		err = tx.Commit()
+		assert.NoError(t, err)
+
+		// Verify all changes
+		val5, ok := store.Get("5")
+		assert.True(t, ok)
+		assert.Equal(t, "updated", val5.Data)
+
+		_, ok = store.Get("1")
+		assert.False(t, ok)
+
+		val6, ok := store.Get("6")
+		assert.True(t, ok)
+		assert.Equal(t, "new", val6.Data)
+	})
+
+	t.Run("Transaction After Store Close", func(t *testing.T) {
+		// Create separate store for this test
+		tempFile := "test_close.db"
+		defer os.Remove(tempFile)
+
+		s, err := dfs.NewStore[string, TestValue](tempFile)
+		assert.NoError(t, err)
+
+		tx := s.Begin()
+		err = tx.Set(TestValue{ID: "7", Data: "test"})
+		assert.NoError(t, err)
+
+		// Close store
+		s.Close()
+
+		// Attempt commit
+		err = tx.Commit()
+		assert.ErrorIs(t, err, dfs.ErrStoreIsClosed)
+	})
+
+	t.Run("Version Increment in Transaction", func(t *testing.T) {
+		// Initial value
+		err := store.Set(TestValue{ID: "8", Data: "v1"})
+		assert.NoError(t, err)
+
+		// Get initial version
+		initial, ok := store.GetOptimistic("8")
+		assert.True(t, ok)
+		assert.Equal(t, 1, initial.Version)
+
+		tx := store.Begin()
+		err = tx.Set(TestValue{ID: "8", Data: "v2"})
+		assert.NoError(t, err)
+		err = tx.Commit()
+		assert.NoError(t, err)
+
+		// Verify version incremented
+		updated, ok := store.GetOptimistic("8")
+		assert.True(t, ok)
+		assert.Equal(t, 2, updated.Version)
+	})
+
+	t.Run("Concurrent Transactions", func(t *testing.T) {
+		// This test verifies isolation between concurrent transactions
+		key := "concurrent"
+		err := store.Set(TestValue{ID: key, Data: "initial"})
+		assert.NoError(t, err)
+
+		// Start two transactions
+		tx1 := store.Begin()
+		tx2 := store.Begin()
+
+		// Modify in tx1
+		err = tx1.Set(TestValue{ID: key, Data: "tx1 value"})
+		assert.NoError(t, err)
+
+		// Modify in tx2 (shouldn't see tx1's changes)
+		err = tx2.Set(TestValue{ID: key, Data: "tx2 value"})
+		assert.NoError(t, err)
+
+		// Commit tx1
+		err = tx1.Commit()
+		assert.NoError(t, err)
+
+		// tx2 should now fail to commit
+		err = tx2.Commit()
+		assert.ErrorIs(t, err, dfs.ErrTransactionConflict)
+
+		// Verify tx1's changes were applied
+		val, ok := store.Get(key)
+		assert.True(t, ok)
+		assert.Equal(t, "tx1 value", val.Data)
+	})
+}
+
+func TestTransactionEdgeCases(t *testing.T) {
+	fileName := "test_edge_cases.db"
+	defer os.Remove(fileName)
+
+	store, err := dfs.NewStore[string, TestValue](fileName)
+	assert.NoError(t, err)
+	defer store.Close()
+
+	t.Run("Empty Transaction", func(t *testing.T) {
+		tx := store.Begin()
+		err := tx.Commit()
+		assert.NoError(t, err) // Should succeed with no operations
+	})
+
+	t.Run("Delete Non-Existent Key", func(t *testing.T) {
+		tx := store.Begin()
+		err := tx.Delete("non-existent")
+		assert.NoError(t, err) // Should succeed with no error
+		err = tx.Commit()
+		assert.NoError(t, err)
+	})
+
+	t.Run("Multiple Operations Same Key", func(t *testing.T) {
+		tx := store.Begin()
+
+		// Set then update same key
+		err := tx.Set(TestValue{ID: "multi", Data: "first"})
+		assert.NoError(t, err)
+		err = tx.Set(TestValue{ID: "multi", Data: "second"})
+		assert.NoError(t, err)
+
+		// Then delete
+		err = tx.Delete("multi")
+		assert.NoError(t, err)
+
+		// Then set again
+		err = tx.Set(TestValue{ID: "multi", Data: "final"})
+		assert.NoError(t, err)
+
+		err = tx.Commit()
+		assert.NoError(t, err)
+
+		// Verify final state
+		val, ok := store.Get("multi")
+		assert.True(t, ok)
+		assert.Equal(t, "final", val.Data)
+	})
+
+	t.Run("Transaction After Deletion", func(t *testing.T) {
+		// Setup - create then delete a key
+		err := store.Set(TestValue{ID: "temp", Data: "to delete"})
+		assert.NoError(t, err)
+		err = store.Delete("temp")
+		assert.NoError(t, err)
+
+		// Transaction attempts to update deleted key
+		tx := store.Begin()
+		err = tx.Set(TestValue{ID: "temp", Data: "resurrected"})
+		assert.NoError(t, err)
+		err = tx.Commit()
+		assert.NoError(t, err)
+
+		// Verify key was resurrected
+		val, ok := store.Get("temp")
+		assert.True(t, ok)
+		assert.Equal(t, "resurrected", val.Data)
+	})
+}
