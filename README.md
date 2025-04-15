@@ -170,6 +170,106 @@ func main() {
 }
 ```
 
+## Transactions
+
+The `Transaction` type provides atomic operations on the `Store` by batching multiple operations together and committing them as a single unit. Transactions support:
+
+- **Atomicity**: All operations in a transaction succeed or fail together
+- **Isolation**: Transactions operate on a snapshot of the data
+- **Consistency**: Version checks prevent conflicts with other concurrent operations
+
+### Transaction Lifecycle
+
+1. **Begin**: Start a new transaction with `store.Begin()`
+2. **Operations**: Perform `Set` and `Delete` operations
+3. **Commit/Rollback**: Either commit changes or rollback the transaction
+
+### Methods
+
+#### `Begin()`
+
+```go
+func (s *Store[K, V]) Begin() *Transaction[K, V]
+```
+
+Creates and returns a new transaction. The transaction operates on a snapshot of the current store state.
+
+#### `Set(v V) error`
+
+```go
+func (t *Transaction[K, V]) Set(v V) error
+```
+
+Adds a value to be set in the transaction. The value must implement the `Keyer` interface. Automatically increments the version number.
+
+#### `Delete(key K) error`
+
+```go
+func (t *Transaction[K, V]) Delete(key K) error
+```
+
+Marks a key for deletion in the transaction. The deletion will only be applied if the key exists and isn't already deleted.
+
+#### `Commit() error`
+
+```go
+func (t *Transaction[K, V]) Commit() error
+```
+
+Attempts to commit all transaction operations atomically. Returns:
+
+- `nil` on success
+- `ErrTransactionConflict` if versions changed since the transaction began
+- `ErrStoreIsClosed` if the store was closed during the transaction
+
+#### `Rollback()`
+
+```go
+func (t *Transaction[K, V]) Rollback()
+```
+
+Cancels the transaction, discarding all pending operations.
+
+### Transaction Example Usage
+
+```go
+// Begin transaction
+tx := store.Begin()
+
+// Perform operations
+err := tx.Set(value1)
+if err != nil {
+    tx.Rollback()
+    return err
+}
+
+err = tx.Delete(key2)
+if err != nil {
+    tx.Rollback()
+    return err
+}
+
+// Commit changes
+if err := tx.Commit(); err != nil {
+    // Handle error
+    return err
+}
+```
+
+### Transaction Error Handling
+
+The transaction may return these errors:
+
+- `ErrTransactionConflict`: Version mismatch detected during commit
+- `ErrStoreIsClosed`: Store was closed during the transaction
+
+### Transaction Implementation Notes
+
+- Transactions operate on a snapshot of the data (copied at `Begin()`)
+- Version numbers are checked at commit time to detect conflicts
+- All operations are batched and written asynchronously after successful validation
+- Rollback is inexpensive as it just discards pending operations
+
 ## Performance Considerations
 
 - **Reads** are extremely fast as they come from memory
