@@ -65,6 +65,24 @@ DFS periodically compacts its data file by:
 
 This keeps the data file size manageable while maintaining all the benefits of append-only storage.
 
+## Usage
+
+```bash
+go get -u github.com/covrom/dfs@latest
+go mod tidy
+```
+
+### Additional Configuration
+For production use, consider these recommended options:
+
+```go
+store, err := dfs.NewStore[string, User]("data.db",
+    dfs.WithCompactionInterval(5*time.Minute),
+    dfs.WithWriteQueueSize(1000),
+    dfs.WithLogger(yourLogger),
+)
+```
+
 ## Examples
 
 ### Basic Usage
