@@ -17,6 +17,9 @@ var (
 
 	// ErrVersionMismatch is returned when an optimistic update fails due to version conflict
 	ErrVersionMismatch = errors.New("version mismatch")
+
+	// ErrTransactionConflict is returned when transaction conflicts with other changes
+	ErrTransactionConflict = errors.New("transaction conflict")
 )
 
 // Keyer defines an interface for types that can provide their own key
@@ -77,10 +80,18 @@ type storeOpts struct {
 	writeQueueSize     int           // size of the write queue
 }
 
+// Transaction represents an atomic transaction
+type Transaction[K comparable, V Keyer[K]] struct {
+	mu         sync.Mutex
+	store      *Store[K, V]
+	cacheCopy  map[K]cacheEntry[V]
+	operations []command[K, V]
+}
+
 // Store is a persistent key-value storage with versioning and compaction support
 type Store[K comparable, V Keyer[K]] struct {
-	cache      map[K]cacheEntry[V] // in-memory cache of records
 	mu         sync.RWMutex        // mutex for concurrent access
+	cache      map[K]cacheEntry[V] // in-memory cache of records
 	file       *os.File            // underlying data file
 	writerChan chan command[K, V]  // channel for writer commands
 	done       chan struct{}       // channel for shutdown signal
@@ -171,6 +182,125 @@ func NewStore[K comparable, V Keyer[K]](fileName string, opts ...StoreOption) (*
 	return s, nil
 }
 
+// Begin starts a new transaction
+func (s *Store[K, V]) Begin() *Transaction[K, V] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshot := make(map[K]cacheEntry[V])
+	for k, v := range s.cache {
+		snapshot[k] = v
+	}
+
+	return &Transaction[K, V]{
+		store:      s,
+		cacheCopy:  snapshot,
+		operations: make([]command[K, V], 0),
+	}
+}
+
+// Set adds a set operation to the transaction
+func (t *Transaction[K, V]) Set(v V) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	key := v.Key()
+	currentEntry, exists := t.cacheCopy[key]
+
+	newVersion := 1
+	if exists {
+		newVersion = currentEntry.version + 1
+	}
+
+	t.cacheCopy[key] = cacheEntry[V]{
+		version: newVersion,
+		value:   v,
+		deleted: false,
+	}
+
+	t.operations = append(t.operations, command[K, V]{
+		record: &fileRecord[K, V]{
+			Key:     key,
+			Version: newVersion,
+			Value:   v,
+			Deleted: false,
+		},
+	})
+
+	return nil
+}
+
+// Delete adds a delete operation to the transaction
+func (t *Transaction[K, V]) Delete(key K) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	currentEntry, exists := t.cacheCopy[key]
+	if !exists || currentEntry.deleted {
+		return nil
+	}
+
+	newVersion := currentEntry.version + 1
+
+	t.cacheCopy[key] = cacheEntry[V]{
+		version: newVersion,
+		deleted: true,
+		value:   currentEntry.value,
+	}
+
+	t.operations = append(t.operations, command[K, V]{
+		record: &fileRecord[K, V]{
+			Key:     key,
+			Version: newVersion,
+			Deleted: true,
+		},
+	})
+
+	return nil
+}
+
+// Commit applies all transaction operations atomically
+func (t *Transaction[K, V]) Commit() error {
+	t.mu.Lock()
+	t.store.mu.Lock()
+
+	// Validate versions
+	for _, op := range t.operations {
+		currentEntry, exists := t.store.cache[op.record.Key]
+		if exists && currentEntry.version >= op.record.Version {
+			return ErrTransactionConflict
+		}
+	}
+
+	// Apply changes
+	for k, v := range t.cacheCopy {
+		t.store.cache[k] = v
+	}
+
+	t.store.mu.Unlock()
+	t.mu.Unlock()
+
+	// Send operations to writer
+
+	for _, op := range t.operations {
+		select {
+		case <-t.store.done:
+			return ErrStoreIsClosed
+		case t.store.writerChan <- op:
+		}
+	}
+
+	return nil
+}
+
+// Rollback cancels the transaction
+func (t *Transaction[K, V]) Rollback() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.operations = nil
+	t.cacheCopy = nil
+}
+
 // writer is the main goroutine that handles asynchronous writes and compaction
 // wantCompact: indicates whether compaction should be performed when possible
 func (s *Store[K, V]) writer(wantCompact bool) {
@@ -198,12 +328,15 @@ func (s *Store[K, V]) execCmd(cmd command[K, V], wantCompact *bool) {
 	if cmd.record != nil {
 		data, err := s.json.Marshal(cmd.record)
 		if err != nil {
+			s.logger.Error("failed to marshal record", "err", err)
 			return
 		}
 		if _, err := s.file.Write(data); err != nil {
+			s.logger.Error("failed to write record", "err", err)
 			return
 		}
 		if _, err := s.file.WriteString("\n"); err != nil {
+			s.logger.Error("failed to write newline", "err", err)
 			return
 		}
 		if cmd.compact {
@@ -384,13 +517,11 @@ func (s *Store[K, V]) Delete(key K) error {
 	}
 
 	newVersion := 1
-	wantCompact := false
-	if entry, ok := s.cache[key]; ok {
-		if !entry.deleted {
-			newVersion = entry.version + 1
-			wantCompact = true
-		}
+	entry, ok := s.cache[key]
+	if !ok || entry.deleted {
+		return nil
 	}
+	newVersion = entry.version + 1
 
 	c := command[K, V]{
 		record: &fileRecord[K, V]{
@@ -398,7 +529,7 @@ func (s *Store[K, V]) Delete(key K) error {
 			Key:     key,
 			Deleted: true,
 		},
-		compact: wantCompact,
+		compact: true,
 	}
 
 	ce := cacheEntry[V]{
