@@ -225,6 +225,7 @@ func (t *Transaction[K, V]) Set(v V) error {
 			Value:   v,
 			Deleted: false,
 		},
+		compact: exists,
 	})
 
 	return nil
@@ -254,6 +255,7 @@ func (t *Transaction[K, V]) Delete(key K) error {
 			Version: newVersion,
 			Deleted: true,
 		},
+		compact: true,
 	})
 
 	return nil
@@ -268,6 +270,8 @@ func (t *Transaction[K, V]) Commit() error {
 	for _, op := range t.operations {
 		currentEntry, exists := t.store.cache[op.record.Key]
 		if exists && currentEntry.version >= op.record.Version {
+			t.store.mu.Unlock()
+			t.mu.Unlock()
 			return ErrTransactionConflict
 		}
 	}
