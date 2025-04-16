@@ -1,11 +1,13 @@
-# dfs
-A high-performance, disk-backed key-value store with versioning and optimistic concurrency control, designed for simplicity and reliability.
+# DFS (Disk-backed File Store)
+
+A high-performance, persistent key-value store with versioning, transactions, and optimistic concurrency control, designed for simplicity and reliability.
 
 ## Features
 
 - **Persistent storage**: All data is safely written to disk in an append-only log
 - **Human-readable format**: Data stored as JSON lines for easy inspection and debugging
 - **Version control**: Every record has a version number that increments on changes
+- **ACID Transactions**: Atomic operations with version checking and conflict detection
 - **Optimistic locking**: Supports concurrent access with version checking
 - **Automatic compaction**: Regularly cleans up deleted records and old versions
 - **Thread-safe**: Safe for concurrent use by multiple goroutines
@@ -18,13 +20,12 @@ DFS is a persistent key-value store that combines in-memory caching with disk-ba
 
 - Persistent storage with fast reads
 - Version tracking of records
+- Transaction support for atomic operations
 - Optimistic concurrency control
 - Human-readable data format for debugging
 - Simple integration without complex setup
 
 The store uses an append-only log for writes, providing durability while maintaining good write performance. All data is stored as JSON lines, making it easy to inspect and modify data directly if needed.
-
-Records are automatically versioned, allowing for optimistic concurrency control patterns where clients can detect and handle conflicts. The store periodically compacts its data file to remove old versions and deleted records.
 
 ## Implementation Details
 
@@ -51,10 +52,18 @@ DFS uses a single-writer goroutine model:
 
 ### Versioning and Optimistic Locking
 
-Every record maintains a version number that increments with each modification. This enables optimistic concurrency control:
-- Clients can read a value and its version
-- When updating, they can specify the expected version
-- The update fails if the version doesn't match (indicating concurrent modification)
+Every record maintains a version number that increments with each modification. This enables:
+- Optimistic concurrency control
+- Transaction conflict detection
+- Change tracking
+
+### Transaction Support
+
+DFS provides ACID transactions with:
+- **Atomicity**: All operations in a transaction succeed or fail together
+- **Consistency**: Version checks prevent conflicts
+- **Isolation**: Transactions operate on a snapshot of the data
+- **Durability**: Committed changes are persisted to disk
 
 ### Compaction
 
@@ -63,29 +72,14 @@ DFS periodically compacts its data file by:
 2. Atomically replacing the old file with the new one
 3. Continuing to append new changes to the compacted file
 
-This keeps the data file size manageable while maintaining all the benefits of append-only storage.
-
-## Usage
+## Installation
 
 ```bash
 go get -u github.com/covrom/dfs@latest
 go mod tidy
 ```
 
-### Additional Configuration
-For production use, consider these recommended options:
-
-```go
-store, err := dfs.NewStore[string, User]("data.db",
-    dfs.WithCompactionInterval(5*time.Minute),
-    dfs.WithWriteQueueSize(1000),
-    dfs.WithLogger(yourLogger),
-)
-```
-
-## Examples
-
-### Basic Usage
+## Basic Usage
 
 ```go
 type User struct {
@@ -121,7 +115,35 @@ func main() {
 }
 ```
 
-### Optimistic Concurrency Control
+## Transaction Usage
+
+```go
+// Begin transaction
+tx := store.Begin()
+
+// Perform operations
+err := tx.Set(User{ID: "user1", Name: "Alice"})
+if err != nil {
+    tx.Rollback()
+    return err
+}
+
+err = tx.Delete("user2")
+if err != nil {
+    tx.Rollback()
+    return err
+}
+
+// Commit changes
+if err := tx.Commit(); err != nil {
+    if errors.Is(err, dfs.ErrTransactionConflict) {
+        fmt.Println("Conflict detected - retry transaction")
+    }
+    return err
+}
+```
+
+## Optimistic Concurrency Control
 
 ```go
 func updateEmail(store *dfs.Store[string, User], userID, newEmail string) error {
@@ -149,7 +171,7 @@ func updateEmail(store *dfs.Store[string, User], userID, newEmail string) error 
 }
 ```
 
-### Custom Configuration
+## Configuration Options
 
 ```go
 func main() {
@@ -170,112 +192,45 @@ func main() {
 }
 ```
 
-## Transactions
+### Available Options
 
-The `Transaction` type provides atomic operations on the `Store` by batching multiple operations together and committing them as a single unit. Transactions support:
+- `WithCompactionInterval(duration)`: Set automatic compaction interval
+- `WithWriteQueueSize(size)`: Configure write queue buffer size
+- `WithLogger(logger)`: Set custom logger
 
-- **Atomicity**: All operations in a transaction succeed or fail together
-- **Isolation**: Transactions operate on a snapshot of the data
-- **Consistency**: Version checks prevent conflicts with other concurrent operations
+## Error Handling
 
-### Transaction Lifecycle
+DFS may return these errors:
 
-1. **Begin**: Start a new transaction with `store.Begin()`
-2. **Operations**: Perform `Set` and `Delete` operations
-3. **Commit/Rollback**: Either commit changes or rollback the transaction
-
-### Methods
-
-#### `Begin()`
-
-```go
-func (s *Store[K, V]) Begin() *Transaction[K, V]
-```
-
-Creates and returns a new transaction. The transaction operates on a snapshot of the current store state.
-
-#### `Set(v V) error`
-
-```go
-func (t *Transaction[K, V]) Set(v V) error
-```
-
-Adds a value to be set in the transaction. The value must implement the `Keyer` interface. Automatically increments the version number.
-
-#### `Delete(key K) error`
-
-```go
-func (t *Transaction[K, V]) Delete(key K) error
-```
-
-Marks a key for deletion in the transaction. The deletion will only be applied if the key exists and isn't already deleted.
-
-#### `Commit() error`
-
-```go
-func (t *Transaction[K, V]) Commit() error
-```
-
-Attempts to commit all transaction operations atomically. Returns:
-
-- `nil` on success
-- `ErrTransactionConflict` if versions changed since the transaction began
-- `ErrStoreIsClosed` if the store was closed during the transaction
-
-#### `Rollback()`
-
-```go
-func (t *Transaction[K, V]) Rollback()
-```
-
-Cancels the transaction, discarding all pending operations.
-
-### Transaction Example Usage
-
-```go
-// Begin transaction
-tx := store.Begin()
-
-// Perform operations
-err := tx.Set(value1)
-if err != nil {
-    tx.Rollback()
-    return err
-}
-
-err = tx.Delete(key2)
-if err != nil {
-    tx.Rollback()
-    return err
-}
-
-// Commit changes
-if err := tx.Commit(); err != nil {
-    // Handle error
-    return err
-}
-```
-
-### Transaction Error Handling
-
-The transaction may return these errors:
-
-- `ErrTransactionConflict`: Version mismatch detected during commit
-- `ErrStoreIsClosed`: Store was closed during the transaction
-
-### Transaction Implementation Notes
-
-- Transactions operate on a snapshot of the data (copied at `Begin()`)
-- Version numbers are checked at commit time to detect conflicts
-- All operations are batched and written asynchronously after successful validation
-- Rollback is inexpensive as it just discards pending operations
+- `ErrStoreIsClosed`: Operations attempted on closed store
+- `ErrVersionMismatch`: Optimistic update version conflict
+- `ErrTransactionConflict`: Transaction commit conflict
 
 ## Performance Considerations
 
-- **Reads** are extremely fast as they come from memory
-- **Writes** are batched and asynchronous for good throughput
-- **Compaction** happens in the background without blocking operations
-- For best performance, size your write queue appropriately for your workload
+- **Reads**: Extremely fast from memory cache
+- **Writes**: Asynchronous with batching for throughput
+- **Transactions**: Snapshot-based with version validation
+- **Compaction**: Background process with minimal impact
+
+For best performance:
+- Size write queue appropriately for your workload
+- Adjust compaction interval based on update frequency
+- Use transactions for batch operations
+
+## Testing
+
+The package includes extensive tests covering:
+- Basic CRUD operations
+- Transaction behavior
+- Concurrency scenarios
+- Edge cases
+- Fuzzy testing with random inputs
+
+Run tests with:
+```bash
+go test -v ./...
+```
 
 ## License
 
@@ -283,4 +238,11 @@ DFS is released under the MIT License. See LICENSE file for details.
 
 ---
 
-This package is ideal for applications that need a simple, persistent key-value store with version tracking and concurrent access support. The human-readable JSON format makes it particularly suitable for development and debugging scenarios.
+This package is ideal for applications that need:
+- Simple persistent key-value storage
+- Transaction support
+- Version tracking
+- Concurrent access
+- Human-readable data format
+
+The combination of transactions and optimistic concurrency control makes it particularly suitable for applications requiring data consistency in concurrent environments.
