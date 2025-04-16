@@ -287,6 +287,12 @@ func (t *Transaction[K, V]) Commit() error {
 	// Send operations to writer
 
 	for _, op := range t.operations {
+		t.store.mu.Lock()
+		if t.store.closed {
+			t.store.mu.Unlock()
+			return ErrStoreIsClosed
+		}
+		t.store.mu.Unlock()
 		select {
 		case <-t.store.done:
 			return ErrStoreIsClosed
