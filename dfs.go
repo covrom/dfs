@@ -523,6 +523,7 @@ func (s *Store[K, V]) Delete(key K) error {
 	newVersion := 1
 	entry, ok := s.cache[key]
 	if !ok || entry.deleted {
+		s.mu.Unlock()
 		return nil
 	}
 	newVersion = entry.version + 1
